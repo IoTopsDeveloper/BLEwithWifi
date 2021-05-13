@@ -13,6 +13,9 @@ dht DHT;
 #include <BLEDevice.h>
 #include <BLEAdvertising.h>
 #include <BLE2902.h>
+#include <Update.h>
+#include "FS.h"
+#include "SPIFFS.h"
 #include <Preferences.h>
 int LEDBuiltInConnected=4;
 int LEDBLEMode=22;
@@ -29,6 +32,23 @@ WiFiMulti wifiMulti;
 char apName[] = "ESP32 AUTO";
 const char compileDate[] = __DATE__ " " __TIME__;
 
+#define FORMAT_SPIFFS_IF_FAILED true
+#define NORMAL_MODE   0   // normal
+#define UPDATE_MODE   1   // receiving firmware
+#define OTA_MODE      2   // installing firmware
+uint8_t updater[16384];
+uint8_t updater2[16384];
+#define FLASH SPIFFS
+static bool writeFile = false;
+static int writeLen = 0;
+static int writeLen2 = 0;
+static bool current = true;
+static int parts = 0;
+static int next = 0;
+static int cur = 0;
+static int MTU = 0;
+static int MODE = NORMAL_MODE;
+
 bool hasCredentials = false;
 volatile bool isConnected = false;
 bool connStatusChanged = false;
@@ -38,6 +58,11 @@ bool connStatusChanged = false;
 #define WIFI_UUID     "00005555-ead2-11e7-80c1-9a214cf093ae"
 #define CONTROL_UUID  "6b464d27-c2da-4df7-8eb9-81357ad247d5"
 #define NOTIFY_UUID   "1404fd3e-979e-43de-bdb2-6234c9ec8cbe"
+#define OTA_UUID                  "fb1e4001-54ae-4a28-9f74-dfccb248601d"
+#define CHARACTERISTIC_UUID_RX    "fb1e4002-54ae-4a28-9f74-dfccb248601d"
+#define CHARACTERISTIC_UUID_TX    "fb1e4003-54ae-4a28-9f74-dfccb248601d"
+static BLECharacteristic* pCharacteristicTX;
+static BLECharacteristic* pCharacteristicRX;
 
 /** SSIDs of local WiFi networks */
 String ssidPrim;
@@ -67,6 +92,11 @@ StaticJsonBuffer<200> JSONBuffer;
  * Callbacks for client connection and disconnection
  */
 
+static void rebootEspWithReason(String reason) {
+  Serial.println(reason);
+  delay(1000);
+  ESP.restart();
+}
 
 
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -241,6 +271,107 @@ if (root.containsKey("Switch")) {
     }
 };
 
+class OTA_Callbacks: public BLECharacteristicCallbacks {
+
+    //    void onStatus(BLECharacteristic* pCharacteristic, Status s, uint32_t code) {
+    //      Serial.print("Status ");
+    //      Serial.print(s);
+    //      Serial.print(" on characteristic ");
+    //      Serial.print(pCharacteristic->getUUID().toString().c_str());
+    //      Serial.print(" with code ");
+    //      Serial.println(code);
+    //    }
+
+    void onNotify(BLECharacteristic *pCharacteristic) {
+      uint8_t* pData;
+      std::string value = pCharacteristic->getValue();
+      int len = value.length();
+      pData = pCharacteristic->getData();
+      if (pData != NULL) {
+        //        Serial.print("Notify callback for characteristic ");
+        //        Serial.print(pCharacteristic->getUUID().toString().c_str());
+        //        Serial.print(" of data length ");
+        //        Serial.println(len);
+        Serial.print("TX  ");
+        for (int i = 0; i < len; i++) {
+          Serial.printf("%02X ", pData[i]);
+        }
+        Serial.println();
+      }
+    }
+
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      uint8_t* pData;
+      std::string value = pCharacteristic->getValue();
+      int len = value.length();
+      pData = pCharacteristic->getData();
+      if (pData != NULL) {
+        //        Serial.print("Write callback for characteristic ");
+        //        Serial.print(pCharacteristic->getUUID().toString().c_str());
+        //        Serial.print(" of data length ");
+        //        Serial.println(len);
+        //        Serial.print("RX  ");
+        //        for (int i = 0; i < len; i++) {         // leave this commented
+        //          Serial.printf("%02X ", pData[i]);
+        //        }
+        //        Serial.println();
+
+        if (pData[0] == 0xFB) {
+          int pos = pData[1];
+          for (int x = 0; x < len - 2; x++) {
+            if (current) {
+              updater[(pos * MTU) + x] = pData[x + 2];
+            } else {
+              updater2[(pos * MTU) + x] = pData[x + 2];
+            }
+          }
+
+        } else if  (pData[0] == 0xFC) {
+          if (current) {
+            writeLen = (pData[1] * 256) + pData[2];
+          } else {
+            writeLen2 = (pData[1] * 256) + pData[2];
+          }
+          current = !current;
+          cur = (pData[3] * 256) + pData[4];
+
+          writeFile = true;
+        } else if (pData[0] == 0xFD) {
+          if (FLASH.exists("/update.bin")) {
+            FLASH.remove("/update.bin");
+          }
+        } else if  (pData[0] == 0xFE) {
+          //rebootEspWithReason("Rebooting to start OTA update");
+
+        } else if  (pData[0] == 0xFF) {
+          parts = (pData[1] * 256) + pData[2];
+          MTU = (pData[3] * 256) + pData[4];
+          MODE = UPDATE_MODE;
+
+        }
+
+
+      }
+
+    }
+
+
+};
+
+void writeBinary(fs::FS &fs, const char * path, uint8_t *dat, int len) {
+
+  //Serial.printf("Write binary file %s\r\n", path);
+
+  File file = fs.open(path, FILE_APPEND);
+
+  if (!file) {
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  file.write(dat, len);
+  file.close();
+}
+
 void initBLE() {
   // Initialize BLE and set output power
   BLEDevice::init(apName);
@@ -280,8 +411,19 @@ void initBLE() {
   // Start the service
   pService->start();
 
+  BLEService *otaService = pServer->createService(OTA_UUID);
+  pCharacteristicTX = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY );
+  pCharacteristicRX = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pCharacteristicRX->setCallbacks(new OTA_Callbacks());
+  pCharacteristicTX->setCallbacks(new OTA_Callbacks());
+  pCharacteristicTX->addDescriptor(new BLE2902());
+  pCharacteristicTX->setNotifyProperty(true);
+  otaService->start();
+
   // Start advertising
   pAdvertising = pServer->getAdvertising();
+  pAdvertising->addServiceUUID(OTA_UUID);
+  pAdvertising->setScanResponse(true);
   pAdvertising->start();
 }
 
@@ -324,6 +466,11 @@ void setup() {
 
   initBLE();
 
+  if (!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+
   Serial.println("");
   if (hasCredentials) {
       wifiMulti.addAP(ssidPrim.c_str(), pwPrim.c_str());
@@ -345,6 +492,11 @@ void setup() {
 
 void loop()
 {  
+
+  switch (MODE) {
+
+    case NORMAL_MODE:
+    
     DHT.read11(dht_dpin);
   if(wifiMulti.run() != WL_CONNECTED) {
     digitalWrite(LEDWifiNotConnected,HIGH);
@@ -366,6 +518,36 @@ void loop()
    CurtainOn();
   CurtainOff();
   Notification();
+
+   break;
+
+    case UPDATE_MODE:
+
+      if (cur + 1 == parts) { // received complete file
+        uint8_t com[] = {0xF2, (cur + 1) / 256, (cur + 1) % 256};
+        pCharacteristicTX->setValue(com, 3);
+        pCharacteristicTX->notify();
+        delay(50);
+        MODE = OTA_MODE;
+      }
+
+      if (writeFile) {
+        if (!current) {
+          writeBinary(FLASH, "/update.bin", updater, writeLen);
+        } else {
+          writeBinary(FLASH, "/update.bin", updater2, writeLen2);
+        }
+        writeFile = false;
+      }
+
+      break;
+
+    case OTA_MODE:
+      updateFromFS(FLASH);
+      break;
+
+  }
+
 }
 
 String PassJson() { 
@@ -432,4 +614,84 @@ pCharacteristic3->setValue((char*) c5);
 pCharacteristic3-> notify ();
 pCharacteristic3->setValue((char*) c6);
 pCharacteristic3-> notify ();
+}
+
+void sendOtaResult(String result) {
+  pCharacteristicTX->setValue(result.c_str());
+  pCharacteristicTX->notify();
+  delay(200);
+}
+
+
+void performUpdate(Stream &updateSource, size_t updateSize) {
+  char s1 = 0x0F;
+  String result = String(s1);
+  if (Update.begin(updateSize)) {
+    size_t written = Update.writeStream(updateSource);
+    if (written == updateSize) {
+      Serial.println("Written : " + String(written) + " successfully");
+    }
+    else {
+      Serial.println("Written only : " + String(written) + "/" + String(updateSize) + ". Retry?");
+    }
+    result += "Written : " + String(written) + "/" + String(updateSize) + " [" + String((written / updateSize) * 100) + "%] \n";
+    if (Update.end()) {
+      Serial.println("OTA done!");
+      result += "OTA Done: ";
+      if (Update.isFinished()) {
+        Serial.println("Update successfully completed. Rebooting...");
+        result += "Success!\n";
+      }
+      else {
+        Serial.println("Update not finished? Something went wrong!");
+        result += "Failed!\n";
+      }
+
+    }
+    else {
+      Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+      result += "Error #: " + String(Update.getError());
+    }
+  }
+  else
+  {
+    Serial.println("Not enough space to begin OTA");
+    result += "Not enough space for OTA";
+  }
+  if (deviceConnected) {
+    sendOtaResult(result);
+    delay(5000);
+  }
+}
+
+void updateFromFS(fs::FS &fs) {
+  File updateBin = fs.open("/update.bin");
+  if (updateBin) {
+    if (updateBin.isDirectory()) {
+      Serial.println("Error, update.bin is not a file");
+      updateBin.close();
+      return;
+    }
+
+    size_t updateSize = updateBin.size();
+
+    if (updateSize > 0) {
+      Serial.println("Trying to start update");
+      performUpdate(updateBin, updateSize);
+    }
+    else {
+      Serial.println("Error, file is empty");
+    }
+
+    updateBin.close();
+
+    // when finished remove the binary from spiffs to indicate end of the process
+    Serial.println("Removing update file");
+    fs.remove("/update.bin");
+
+    rebootEspWithReason("Rebooting to complete OTA update");
+  }
+  else {
+    Serial.println("Could not load update.bin from spiffs root");
+  }
 }
