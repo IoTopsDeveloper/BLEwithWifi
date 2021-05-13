@@ -422,7 +422,7 @@ void initBLE() {
 
   // Start advertising
   pAdvertising = pServer->getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->addServiceUUID(OTA_UUID);
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
 }
